@@ -430,8 +430,9 @@ the cache."
       (setq helm-source-vdirel
             (add-to-list
              'helm-source-vdirel
-             (helm-build-sync-source "Contacts from the mu database"
+             (helm-build-sync-source "Mu database"
                :candidates (vdirel-helm-email-candidates (helm-mu-contacts-init))
+               :persistent-action  'identity
                :action (helm-make-actions "INSERT" 'vdirel-helm-insert-contact-email)
                ;;          "VISIT VCARD" 'vdirel-helm-open-contact-vcard
                ;;          "VISIT ORG" 'vdirel-helm-open-org-entry-vcard
