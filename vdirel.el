@@ -4,7 +4,7 @@
 
 ;; Author: Damien Cassou <damien@cassou.me>
 ;; Author: Aurélien Bosché <aurelien_bosche@yahoo.com>
-;; Version: 0.1.0
+;; Version: 1.0.0
 ;; GIT: https://github.com/taurgal/vdirel
 ;; Package-Requires: ((emacs "24.4") (org-vcard "0.1.0") (helm "1.7.0") (seq "1.11"))
 ;; Created: 09 Dec 2015
@@ -33,13 +33,14 @@
 (require 'org-vcard)
 (require 'seq)
 (require 'helm)
+(require 'helm-mu)
 
 (defgroup vdirel nil
   "Manipulate vdir (i.e., vCard) repositories from Emacs"
   :group 'applications)
 
 (defface vdirel-contacts-name-face
-  (cond  ((boundp helm-mu-contacts-name-face)
+  (cond  ((boundp 'helm-mu-contacts-name-face)
           helm-mu-contacts-name-face)
          (t
   '((((background dark)) :foreground "white")
@@ -48,11 +49,12 @@
   :group 'vdirel-faces)
 
 (defface vdirel-contacts-address-face
-  (cond  ((boundp helm-mu-contacts-address-face)
+  (cond
+   ((boundp 'helm-mu-contacts-address-face)
           helm-mu-contacts-address-face)
          (t
-  '((((background dark)) :foreground "gray")
-    (t :foreground "dim gray"))))
+  '((((background dark)) :foreground "#1e90ff")
+    (t :foreground "#1e90ff"))))
   "Face for email addresses in contacts list."
   :group 'vdirel-faces)
 
@@ -70,7 +72,8 @@
 
 
 (defcustom vdirel-repositories nil
-  "List of paths to vdir directories (each containing vcard files)."
+  "List of repositories.
+A repository is a plist with at least a :name and a :dir property."
   :group 'vdirel)
 
 (defvar vdirel-cache-contacts '()
@@ -91,7 +94,7 @@ always create the headline."
 
 (defcustom vdirel-org-entry-template
   "\n* {:full-name}\n  :PROPERTIES:\n  :CUSTOM_ID: {:UID}\n  :END:"
-  "Template used for org headline.
+  "Template used for org headlines.
 See also `vdirel-create-org-headline-if-needed' and
 `vdirel-expand-template'. Possible keys are taken from the vcard
 with the addition of :full-name."
@@ -105,31 +108,55 @@ string or a plist) for default values. If PLIST_DEF is a string
 then it is the default value for all replacements, otherwise the
 default value is looked up in PLIST_DEF just like values are
 looked up in PLIST."
-  (replace-regexp-in-string "{\\(:[$&*+-_<>[:alpha:]]+\\)}"
-                            (lambda (symb_name_as_str)
-                              (let* ((keyword (intern (substring symb_name_as_str 1 -1)))
-                                     (value (or (plist-get plist keyword)
-                                                (cond ((stringp plist_def) plist_def)
+  (setq ss s
+        pp plist)
+  (condition-case nil
+      (replace-regexp-in-string "{\\(:[$&*+-_<>[:alpha:]]+\\)}"
+                                (lambda (symb_name_as_str)
+                                  (let* ((keyword (intern (substring symb_name_as_str 1 -1)))
+                                         (value (or (plist-get plist keyword)
+                                                    (cond ((stringp plist_def) plist_def)
                                                       (t (plist-get plist_def keyword))))))
-                                (format "%s" value)))
-                            s))
+                                    (format "%s" value)))
+                                s)
+    ((error nil))))
 
 (defun vdirel-get-repository-name (repository)
   "Return the name of the REPOSITORY."
   (plist-get repository :name))
 
+(defun vdirel-get-repository-from-name (reponame)
+  "Return the repository with name REPONAME."
+  (let ((repolist
+         (-filter
+          (lambda (r) (string= (vdirel-get-repository-name r) reponame))
+          vdirel-repositories)))
+    (cond ((> (length repolist) 1)
+           (error "There are %d≠1 repositories named %s." (length repolist) reponame))
+          ((< (length repolist) 1)
+           (error "There are no repositories named %s." (length repolist) reponame))
+          (t (first repolist)))
+          ))
+
 (defun vdirel-get-repository-org-filename (repository)
-  "Return the name of the REPOSITORY."
+  "Return the filename of the org-file of REPOSITORY."
   (plist-get repository :org-filename))
 
 (defun vdirel-get-repository-dir (repository)
   "Return the directory of the REPOSITORY."
-  (expand-file-name (plist-get repository :dir)))
+  (let ((dir (plist-get repository :dir)))
+    (cond ((stringp dir) (expand-file-name dir))
+          (t dir))
+    ))
 
-(defun vdirel-get-contact-property (property contact)
-  "Return value of first property named PROPERTY in CONTACT.
+(defun vdirel-get-repository-priority (repository)
+  "Return the directory of the REPOSITORY."
+  (or (plist-get repository :priority) 0))
+
+(defun vdirel-get-contact-property (property contact &optional default)
+  "Return the value of the first property named PROPERTY in CONTACT.
 Return nil if PROPERTY is not in CONTACT."
-  (assoc-default property contact #'string= nil))
+  (assoc-default property contact #'string= default))
 
 (defun vdirel-get-contact-properties (property contact)
   "Return values of all properties named PROPERTY in CONTACT."
@@ -137,33 +164,60 @@ Return nil if PROPERTY is not in CONTACT."
    (lambda (propname) (string= propname property))
    contact))
 
+(defun vdirel-get-contact-properties-surrounded (property contact s)
+  "Return values of all properties named PROPERTY in CONTACT."
+  (let ((prop (mapconcat 'identity
+                         (vdirel-get-contact-matching-properties
+                          (lambda (propname) (string= propname property))
+                          contact)
+                         ",")))
+    (concat s (replace-regexp-in-string "," s prop) s)
+    ))
+
 (defun vdirel-get-contact-matching-properties (pred contact)
   "Return values of all properties whose name match PRED in CONTACT."
   (seq-map #'cdr (seq-filter (lambda (pair)
                                (funcall pred (car pair)))
                              contact)))
 
-(defun vdirel-contact-fullname (contact &optional with-prefix-and-suffix)
+(defun vdirel-string-or-nil-if-empty (s)
+  (if (or (null s) (string-empty-p s)) nil s))
+
+(defun vdirel-contact-fullname (contact)
   "Return the fullname of CONTACT (but without additional names).
-If WITH-PREFIX-AND-SUFFIX is non nil then add prefix and suffix from the `N'
-property if the `FN' property is not given."
+Use the FN field in contact if present, otherwise use the N field."
   (or
-   (vdirel-get-contact-property "FN" contact)
-   (pcase (split-string (vdirel-get-contact-property "N" contact)
-                        "\\([^\\]\\|\\`\\);")
-     (`(,surname ,name ,add-names ,pref ,suff)
-      (if with-prefix-and-suffix
-          (format "%s %s %s %s" pref surname name suff)
-        (format "%s %s" surname name))
-     )
+   (and (stringp contact)
+        (mapconcat 'identity (cdr (split-string contact "\t" t "[\t ]+")) " "))
+   (vdirel-string-or-nil-if-empty
+    (vdirel-get-contact-property "FN" contact "")
+    )
+   (and (vdirel-get-contact-property "N" contact "")
+        (pcase (split-string (vdirel-get-contact-property "N" contact "")
+                        ";")
+          (`(,surname ,name ,add-names ,pref ,suff)
+           (mapconcat
+            'identity
+            (-filter (lambda (s) (not (or (null s) (string-empty-p s))))
+                     (list pref surname name suff))
+            " ")
+           )
      (_ (error "Malformed `N' property in VCARD"))
-     )))
+     ))
+   (vdirel-get-contact-property "NONAME" contact)
+   ))
+
+(defun vdirel-contact-uid (contact)
+  "Return the UID of CONTACT or nil."
+  (vdirel-get-contact-property "UID" contact))
 
 (defun vdirel-contact-emails (contact)
   "Return a list of CONTACT's email addresses."
+  (or
+   (and (stringp contact) (car (split-string contact "\t" t "[\t ]+")))
   (vdirel-get-contact-matching-properties
    (lambda (property) (string-match "^EMAIL" property))
-   contact))
+   contact)))
 
 
 (defun vdirel-get-contacts-from-cache (repository)
@@ -176,8 +230,18 @@ property if the `FN' property is not given."
 
 (defun vdirel-get-repository-contact-files (repository)
   "Return a list of vCard files in REPOSITORY."
-  (directory-files
-   (vdirel-get-repository-dir repository) t "\.vcf$" t))
+  (let ((dir (vdirel-get-repository-dir repository)))
+    (cond ((stringp dir) (directory-files dir  t "\.vcf$" t))
+          (error "This is not a vdir: '%S'" dir))
+    ))
+
+(defun vdirel-is-vcard-repo (repository)
+  (stringp (vdirel-get-repository-dir repository)))
+
+(defun vdirel-filter-vcard-repos ()
+  "Return a list of vCard files in REPOSITORY from `vdirel-repositories'."
+  (-filter #'vdirel-is-vcard-repo vdirel-repositories)
+  )
 
 (defun vdirel-get-contact-files ()
   "Return a list of vCard files."
@@ -205,16 +269,23 @@ through `org-vcard-import-parse'."
 
 (defun vdirel-build-contacts-from-repository (repository)
   "Return a list of contacts in REPOSITORY."
-  (mapcar
-   (lambda (contact)
-     (cons `("VDIREL-REPOSITORY" . ,repository) contact)
-     )
-  (mapcar
-   #'vdirel-parse-file-to-contact
-   (vdirel-get-repository-contact-files repository))))
+  (let ((repodir (vdirel-get-repository-dir repository)))
+    (cond ((stringp repodir)
+           (mapcar
+            (lambda (contact)
+              (cons `("VDIREL-REPOSITORY" . ,repository) contact)
+              )
+            (mapcar
+             #'vdirel-parse-file-to-contact
+             (vdirel-get-repository-contact-files repository))))
+          ((eq repodir :mu)
+           (helm-mu-contacts-init)
+           ))
+    ))
 
 (defun vdirel-recreate-cache ()
-  "Parse all contacts in REPOSITORY and store the result."
+  "Parse all contacts in the repositories and store the result.
+Repositories are those in `vdirel-repositories'"
   (interactive)
   (setq vdirel-cache-contacts nil)
   (dolist (repository vdirel-repositories)
@@ -225,7 +296,7 @@ through `org-vcard-import-parse'."
         )))
   vdirel-cache-contacts
   )
-  
+
 (defun vdirel-debug-info (string &rest objects)
   "Log STRING with OBJECTS as if using `format`."
   (apply #'message (concat "[carldavel] info: " string) objects))
@@ -256,27 +327,26 @@ without further argument."
                            (list
                             :name
                             (propertize
-                             (format "%-30.30s"
-                                     (vdirel-contact-fullname contact t)
+                             (format "%-20.20s"
+                                     (vdirel-contact-fullname contact)
                                      'face 'vdirel-contacts-name-face))
                             :mail
                             (propertize
-                             (format "%-40.40s"
+                             (format "%-35.35s"
                                      (mapconcat (lambda (x) (concat "<" x ">"))
-                                                (vdirel-contact-emails contact) ", ")
-                                     'face 'vdirel-contacts-address-face))
+                                                (vdirel-contact-emails contact) ", "))
+                                     'face 'vdirel-contacts-address-face)
                             :categories
+                            (format "%s"
                             (propertize
-                             (mapconcat 'identity
-                                        (vdirel-get-contact-properties "CATEGORIES" contact)
-                                        ", ")
-                             'face 'vdirel-contacts-categories-face)
+                             (vdirel-get-contact-properties-surrounded "CATEGORIES" contact ":")
+                             'face 'vdirel-contacts-categories-face))
                             :group
-                            (propertize
-                             (mapconcat 'identity
-                                        (vdirel-get-contact-properties "GROUP" contact)
-                                        ", ")
-                             'face 'vdirel-contacts-group-face))
+                            (format "%-20.20s"
+                                    (propertize
+                                     (vdirel-get-contact-properties-surrounded "GROUP" contact "~")
+                                     'face 'vdirel-contacts-group-face))
+                            )
                            )
                       contact
                       ))
@@ -287,19 +357,14 @@ without further argument."
 CANDIDATE is ignored."
   (ignore candidate)
   (insert (mapconcat (lambda (contact)
-                       (format "\"%s\" <%s>"
-                               (vdirel-contact-fullname contact)
-                               (car (vdirel-contact-emails contact))))
+                       (if (vdirel-contact-fullname contact)
+                           (format "%S <%s>"
+                                   (vdirel-contact-fullname contact)
+                                   (car (vdirel-contact-emails contact)))
+                         (format "<%s>"
+                         (car (vdirel-contact-emails contact)))))
                      (helm-marked-candidates)
                      ", ")))
-
-(defun vdirel-helm-run-compose-mail-to ()
-  "Execute `vdirel-helm-open-org-entry-vcard' without quitting."
-    (interactive)
-    (with-helm-alive-p
-      (helm-attrset 'compose-mail 'vdirel-helm-compose-mail-to)
-      (helm-execute-persistent-action 'compose-mail)))
-(put 'vdirel-helm-compose-mail-to 'helm-only t)
 
 (defun vdirel-helm-run-compose-mail-to ()
   "Wrapper around `vdirel-helm-compose-mail-to'."
@@ -336,9 +401,9 @@ ignored."
 
 
 (defun vdirel-helm-open-contact-vcard (candidate)
-  "Open vcard file correpsonding to CANDIDATE.
-If it is not already in the persistent window and revert to the
-previous buffer otherwise."
+  "Open vcard file of CANDIDATE.
+Open vcard file if it is not already in the persistent window and
+revert to the previous buffer otherwise."
   (let* ((current (window-buffer helm-persistent-action-display-window))
          (filepath  (vdirel-get-contact-property "VDIREL-FILENAME" candidate))
          (bufname (file-name-nondirectory filepath)))
@@ -348,10 +413,26 @@ previous buffer otherwise."
           (find-file filepath)
         (switch-to-buffer helm-current-buffer))))
 
+(defun vdirel-helm-create-contact-vcard (candidate)
+  "Create vcard file of CANDIDATE.
+Ask for a repository name and store CANDIDATE in the corresponding vdir."
+  (interactive)
+  (let* ((reponame
+          (completing-read "Create vcard in repo:" (vdirel-cached-repository-names) #'identity t))
+         (repo (vdirel-get-repository-from-name reponame))
+         (repodir (vdirel-get-repository-dir repo))
+         (UID (org-id-uuid))
+         (filepath (format "%s/%s.vcf" repodir UID)))
+    (find-file filepath)
+    (yas-expand-snippet-by-name "complete vcard")
+    ))
+
 (defvar helm-vdirel-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map helm-map)
     (define-key map (kbd "C-c o") 'vdirel-helm-run-open-org-entry-vcard)
+    (define-key map (kbd "C-c v") 'vdirel-helm-run-open-org-entry-vcard)
+    (define-key map (kbd "C-c c") 'vdirel-helm-run-create-contact-vcard)
     (define-key map (kbd "C-c m") 'vdirel-helm-run-compose-mail-to)
     (delq nil map))
   "Keymap for `helm-vdirel-select-contact'.")
@@ -361,8 +442,22 @@ previous buffer otherwise."
     (interactive)
     (with-helm-alive-p
       (helm-attrset 'open-org 'vdirel-helm-open-org-entry-vcard)
-      (helm-execute-persistent-action 'open-org)))
-(put 'helm-ff-run-kill-buffer-persistent 'helm-only t)
+      (helm-execute-persistent-action 'vdirel-helm-open-org-entry-vcard)))
+(put 'vdirel-helm-run-open-org-entry-vcard 'helm-only t)
+
+(defun vdirel-helm-run-open-contact-vcard ()
+  "Execute `vdirel-helm-open-contact-vcard' without quitting."
+  (interactive)
+  (with-helm-alive-p
+    (helm-attrset 'open-vcard 'vdirel-helm-open-contact-vcard)
+    (helm-execute-persistent-action 'open-vcard)))
+(put 'vdirel-helm-run-open-contact-vcard 'helm-only t)
+
+(defun vdirel-helm-run-create-contact-vcard ()
+  "Execute `vdirel-helm-create-contact-vcard' without quitting."
+  (interactive)
+    (helm-exit-and-execute-action #'vdirel-helm-create-contact-vcard))
+(put 'vdirel-helm-run-create-contact-vcard 'helm-only t)
 
 (defun vdirel-helm-open-org-entry-vcard (candidate)
   "Open org file for CANDIDATE."
@@ -390,10 +485,14 @@ previous buffer otherwise."
           (progn
             (find-file orgfilename)
             (goto-char (point-max))
+            (if (not (bolp)) (insert "\n"))
             (insert
              (vdirel-expand-template
               vdirel-org-entry-template
-              (nconc `(:full-name ,(vdirel-contact-fullname candidate))
+              (nconc `(:full-name
+                       ,(vdirel-contact-fullname candidate)
+                       :UID
+                       ,(or (vdirel-contact-uid candidate) (org-id-uuid)))
                     (vdirel-alist-plist candidate t))
               "??"
               )))
@@ -401,16 +500,15 @@ previous buffer otherwise."
         )
       )))
 
-
 (defun vdirel-cached-repository-names ()
-  "Return a list of vCard files from the defined repositories.
+  "Return the list of names of the defined repositories.
 See `vdirel-repositories'."
+  (interactive)
   (seq-uniq
    (mapcar 'vdirel-get-repository-name vdirel-repositories)
    #'string=)
   )
 
-;;;###autoload
 (defun helm-vdirel-select-contact (&optional refresh)
   "Prompt for a contact from the vdir repos using helm.
 With a prefix argument REFRESH, first recreate the cache. With a
@@ -426,28 +524,18 @@ the cache."
     (vdirel-recreate-cache))
   (let ((helm-source-vdirel))
     (setq helm-source-vdirel nil)
-    (when (require 'helm-mu nil 'noerror)
-      (setq helm-source-vdirel
-            (add-to-list
-             'helm-source-vdirel
-             (helm-build-sync-source "Mu database"
-               :candidates (vdirel-helm-email-candidates (helm-mu-contacts-init))
-               :persistent-action  'identity
-               :action (helm-make-actions "INSERT" 'vdirel-helm-insert-contact-email)
-               ;;          "VISIT VCARD" 'vdirel-helm-open-contact-vcard
-               ;;          "VISIT ORG" 'vdirel-helm-open-org-entry-vcard
-               ;;          "COMPOSE MAIL" 'vdirel-helm-compose-mail-to
-               ;;          )
-               ;; :persistent-action  'vdirel-helm-open-contact-vcard
-               ;; :persistent-help "Toggle showing vcard in current window"
-               ;; :keymap 'helm-vdirel-map
-               )
-             )))
-    (dolist (repo vdirel-repositories)
+    (dolist (repo  vdirel-repositories)
       (setq helm-source-vdirel
             (add-to-list
              'helm-source-vdirel
              (helm-build-sync-source (vdirel-get-repository-name repo)
+               :header-name (lambda (s)
+                              (format
+                               "%s (vdir repo %S)"
+                               s
+                               (vdirel-get-repository-dir
+                                (vdirel-get-repository-from-name
+                                 s))))
                :candidates (vdirel-helm-email-candidates (vdirel-get-contacts-from-cache repo))
                :action (helm-make-actions
                         "INSERT" 'vdirel-helm-insert-contact-email
@@ -459,6 +547,7 @@ the cache."
                :persistent-help "Toggle showing vcard in current window"
                :keymap 'helm-vdirel-map
                )
+             t
              )))
     (helm :prompt "Contacts: "
           :buffer "*helm vdirel*"
